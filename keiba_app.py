@@ -14,23 +14,126 @@
 # ============================================================
 
 import streamlit as st
-import sqlite3
 import pandas as pd
 import re  # JRA結果テキストを解析するために使用
 
+# ============================================================
+# データベース接続(SQLite / PostgreSQL(Supabase) 両対応)
+# ============================================================
+# st.secrets に "db_url" があれば PostgreSQL(Supabase)に接続。
+# なければローカルの keiba.db (SQLite) を使う。
+# これでPCでもクラウドでも同じコードで動く。
+
 DB_FILE = "keiba.db"
+
+
+def _get_db_url():
+    try:
+        return st.secrets["db_url"]
+    except Exception:
+        return None
+
+
+USE_POSTGRES = _get_db_url() is not None
+
+# pandas read_sql 用のプレースホルダ(?か%s)
+PH = "%s" if USE_POSTGRES else "?"
+
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extras
+else:
+    import sqlite3
+
+
+class _CursorWrapper:
+    """SQLiteとPostgreSQLの違いを吸収するカーソルラッパー。
+    既存コードの ? プレースホルダを、PostgreSQLでは %s に自動変換する。
+    """
+    def __init__(self, real_cursor, is_pg):
+        self._cur = real_cursor
+        self._is_pg = is_pg
+
+    def execute(self, sql, params=()):
+        if self._is_pg:
+            sql = sql.replace("?", "%s")
+            sql = sql.replace("INSERT OR REPLACE", "INSERT")
+        self._cur.execute(sql, params)
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    @property
+    def lastrowid(self):
+        return getattr(self._cur, "lastrowid", None)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _ConnWrapper:
+    """接続のラッパー。SQLite/PostgreSQLの違いを吸収する。"""
+    def __init__(self, real_conn, is_pg):
+        self._conn = real_conn
+        self._is_pg = is_pg
+
+    def cursor(self):
+        if self._is_pg:
+            real = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        else:
+            real = self._conn.cursor()
+        return _CursorWrapper(real, self._is_pg)
+
+    def execute(self, sql, params=()):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
 
 
 # ============================================================
 # 【2】データベース処理
 # ============================================================
 def get_connection():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if USE_POSTGRES:
+        conn = psycopg2.connect(_get_db_url())
+        return _ConnWrapper(conn, True)
+    else:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return _ConnWrapper(conn, False)
 
 
 def init_db():
+    # PostgreSQL(Supabase)の場合、テーブルはSupabase側で作成済みなのでスキップ
+    if USE_POSTGRES:
+        # 念のため、auto_rating / class 列が無ければ追加(エラーは無視)
+        conn = get_connection()
+        cur = conn.cursor()
+        for sql in [
+            "ALTER TABLE horses ADD COLUMN IF NOT EXISTS auto_rating INTEGER",
+            "ALTER TABLE races ADD COLUMN IF NOT EXISTS class TEXT",
+        ]:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        conn.close()
+        return
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -74,12 +177,10 @@ def init_db():
             cur.execute(f"ALTER TABLE results ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass
-    # horses に auto_rating(自動評価)を追加
     try:
         cur.execute("ALTER TABLE horses ADD COLUMN auto_rating INTEGER")
     except sqlite3.OperationalError:
         pass
-    # races に class(クラス: G1/G2/G3/オープン/L/3勝/2勝/1勝/未勝利/新馬)を追加
     try:
         cur.execute("ALTER TABLE races ADD COLUMN class TEXT")
     except sqlite3.OperationalError:
@@ -90,7 +191,6 @@ def init_db():
             bet_type TEXT, selection TEXT, amount INTEGER, payout INTEGER,
             hit INTEGER, memo TEXT
         )""")
-    # 設定値を保存するシンプルなテーブル (key-value形式)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -116,7 +216,7 @@ def set_setting(key, value):
 
 def load_table(table_name):
     conn = get_connection()
-    df = pd.read_sql(f"SELECT * FROM {table_name}", conn)
+    df = pd.read_sql(f"SELECT * FROM {table_name}", conn._conn)
     conn.close()
     return df
 
@@ -152,11 +252,20 @@ def run_sql(sql, params=()):
 
 
 def run_sql_returning_id(sql, params=()):
-    """INSERTを実行して、その行のidを返す。INSERTとlast_insert_rowidを同じ接続で行う。"""
+    """INSERTを実行して、その行のidを返す。
+    SQLiteは lastrowid、PostgreSQLは RETURNING id を使う。
+    """
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(sql, params)
-    new_id = cur.lastrowid
+    if USE_POSTGRES:
+        # PostgreSQLは末尾に RETURNING id を付けてidを取得
+        sql_ret = sql.rstrip().rstrip(";") + " RETURNING id"
+        cur.execute(sql_ret, params)
+        row = cur.fetchone()
+        new_id = row["id"] if row else None
+    else:
+        cur.execute(sql, params)
+        new_id = cur.lastrowid
     conn.commit()
     conn.close()
     return new_id
@@ -1691,7 +1800,7 @@ elif menu == "🎯 予想":
                     st.success("追加しました。"); st.rerun()
 
         conn = get_connection()
-        entries = pd.read_sql("SELECT * FROM entries WHERE race_id=?", conn, params=(race_id,))
+        entries = pd.read_sql(f"SELECT * FROM entries WHERE race_id={PH}", conn._conn, params=(race_id,))
         conn.close()
 
         if len(entries) == 0:
@@ -1746,9 +1855,9 @@ elif menu == "🎯 予想":
             # 出走馬の削除
             with st.expander("🗑 出走馬を削除する"):
                 conn = get_connection()
-                ent2 = pd.read_sql("SELECT e.id, e.number, h.name FROM entries e "
-                                   "LEFT JOIN horses h ON e.horse_id=h.id "
-                                   "WHERE e.race_id=?", conn, params=(race_id,))
+                ent2 = pd.read_sql(f"SELECT e.id, e.number, h.name FROM entries e "
+                                   f"LEFT JOIN horses h ON e.horse_id=h.id "
+                                   f"WHERE e.race_id={PH}", conn._conn, params=(race_id,))
                 conn.close()
                 d_opt = {f'{r["number"]} {r["name"]}': r["id"] for _, r in ent2.iterrows()}
                 d_sel = st.selectbox("削除する出走馬", [""] + list(d_opt.keys()))
@@ -1827,7 +1936,7 @@ elif menu == "🏆 結果":
         choice = st.selectbox("レースを選ぶ", list(race_opt.keys()))
         race_id = race_opt[choice]
         conn = get_connection()
-        df = pd.read_sql("""
+        df = pd.read_sql(f"""
             SELECT r.finish AS 着順, e.frame AS 枠, e.number AS 馬番,
                    h.name AS 馬名, j.name AS 騎手,
                    r.time AS タイム, r.margin AS 着差,
@@ -1838,9 +1947,9 @@ elif menu == "🏆 結果":
             LEFT JOIN horses h ON e.horse_id=h.id
             LEFT JOIN jockeys j ON e.jockey_id=j.id
             LEFT JOIN results r ON e.id=r.entry_id
-            WHERE e.race_id=?
+            WHERE e.race_id={PH}
             ORDER BY CASE WHEN r.finish IS NULL THEN 999 ELSE r.finish END""",
-            conn, params=(race_id,))
+            conn._conn, params=(race_id,))
         conn.close()
         if len(df) == 0:
             st.info("このレースの出走・結果データがありません。")
