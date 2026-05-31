@@ -57,9 +57,34 @@ class _CursorWrapper:
     def execute(self, sql, params=()):
         if self._is_pg:
             sql = sql.replace("?", "%s")
-            sql = sql.replace("INSERT OR REPLACE", "INSERT")
+            sql = self._convert_upsert(sql)
         self._cur.execute(sql, params)
         return self
+
+    def _convert_upsert(self, sql):
+        """SQLiteの INSERT OR REPLACE を PostgreSQL の
+        INSERT ... ON CONFLICT (主キー) DO UPDATE に変換する。
+        """
+        if "INSERT OR REPLACE" not in sql:
+            return sql
+        # テーブルごとの主キー
+        pk_map = {"races": "id", "settings": "key", "horses": "id",
+                  "jockeys": "id"}
+        # INSERT OR REPLACE INTO <table> (col1, col2, ...) VALUES ...
+        m = re.search(r"INSERT OR REPLACE INTO\s+(\w+)\s*\(([^)]+)\)", sql, re.IGNORECASE)
+        if not m:
+            return sql.replace("INSERT OR REPLACE", "INSERT")
+        table = m.group(1)
+        cols = [c.strip() for c in m.group(2).split(",")]
+        pk = pk_map.get(table, "id")
+        # 主キー以外の列を「DO UPDATE SET col=EXCLUDED.col」にする
+        update_cols = [c for c in cols if c != pk]
+        set_clause = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_cols)
+        sql = sql.replace("INSERT OR REPLACE", "INSERT")
+        # VALUES(...) の後ろに ON CONFLICT を足す
+        sql = sql.rstrip().rstrip(";")
+        sql += f" ON CONFLICT ({pk}) DO UPDATE SET {set_clause}"
+        return sql
 
     def fetchone(self):
         return self._cur.fetchone()
