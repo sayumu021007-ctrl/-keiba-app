@@ -316,7 +316,14 @@ def next_id(table, prefix):
 # 【3】点数計算ロジック
 # ============================================================
 def categorize_distance(distance):
-    d = int(distance) if distance else 0
+    # 距離が数字に変換できない場合(空・文字混じり等)も落ちないようにする
+    try:
+        d = int(distance) if distance not in (None, "") else 0
+    except (ValueError, TypeError):
+        # "2400m" のように単位付きでも数字だけ拾う
+        import re as _re
+        m = _re.search(r"\d+", str(distance))
+        d = int(m.group()) if m else 0
     if d == 0:
         return ""
     if d <= 1400:
