@@ -1798,6 +1798,140 @@ elif menu == "📅 レース":
             else:
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
+                # ===== コーナー通過順まとめ(全馬を横並び) =====
+                corner_rows = []
+                max_corners = 0
+                for _, row in df.iterrows():
+                    corner_str = str(row.get("通過順") or "").strip()
+                    # スペースまたはハイフン区切りの数字を取り出す
+                    nums = re.findall(r"\d+", corner_str)
+                    max_corners = max(max_corners, len(nums))
+                    corner_rows.append((row.get("馬番"), row.get("馬名"),
+                                        row.get("着順"), nums))
+                if max_corners > 0:
+                    with st.expander("🏁 コーナー通過順まとめ(全馬・展開を見る)", expanded=True):
+                        st.caption("各コーナーでの順位を、全馬まとめて表示。"
+                                   "数字が小さい=前、大きい=後ろ。右ほどゴールに近い。"
+                                   "コーナー数が少ない馬は右詰め(最終コーナーを揃える)。")
+                        # コーナー名(最後が4角になるように右詰め)
+                        corner_labels_all = ["1角", "2角", "3角", "4角"]
+                        if max_corners <= 4:
+                            labels = corner_labels_all[4 - max_corners:]
+                        else:
+                            labels = [f"{i+1}角" for i in range(max_corners)]
+                        table = []
+                        for num, name, finish, nums in corner_rows:
+                            # 右詰め: 足りない分は左を空欄に
+                            padded = [""] * (max_corners - len(nums)) + nums
+                            d = {"着順": finish, "馬番": num, "馬名": name}
+                            for lab, val in zip(labels, padded):
+                                d[lab] = val
+                            table.append(d)
+                        cdf = pd.DataFrame(table).sort_values(
+                            "着順", na_position="last").reset_index(drop=True)
+                        st.dataframe(cdf, use_container_width=True, hide_index=True)
+
+                # ===== 予想 vs 結果(振り返り分析) =====
+                # 結果(着順)があるレースだけ分析する
+                has_result = df["着順"].notna().any()
+                if has_result:
+                    yosou = calculate_race_scores(race_id)
+                    if yosou:
+                        # 着順を馬番から引けるようにする
+                        finish_by_num = {}
+                        for _, row in df.iterrows():
+                            if pd.notna(row.get("着順")):
+                                finish_by_num[row["馬番"]] = int(row["着順"])
+
+                        st.divider()
+                        st.subheader("🔍 予想 vs 結果(振り返り)")
+                        st.caption("予想点・予想順位と、実際の着順を並べます。"
+                                   "予想がどれくらい当たったか、何を見落としたかの振り返りに。")
+
+                        # 予想順位をつける(予想点の高い順)
+                        comp = []
+                        for yrank, h in enumerate(yosou, 1):
+                            num = h["馬番"]
+                            actual = finish_by_num.get(num)
+                            d = h["_detail"]
+                            # 当たり判定
+                            if actual is None:
+                                mark = ""
+                            elif yrank == 1 and actual == 1:
+                                mark = "◎的中!"
+                            elif yrank <= 3 and actual <= 3:
+                                mark = "◯好"
+                            elif actual <= 3:
+                                mark = "△来"
+                            else:
+                                mark = "✕"
+                            comp.append({
+                                "予想順位": yrank, "馬番": num, "馬名": h["馬名"],
+                                "予想点": h["予想点"], "実際の着順": actual,
+                                "結果": mark,
+                                "前走": d["zenso"], "速さ": d["speed"], "適性": d["fit"],
+                                "クラス": d["klass"], "騎手": d["jockey"],
+                                "人気": h["人気"],
+                            })
+                        comp_df = pd.DataFrame(comp)
+                        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+                        # ===== なぜこの馬が勝ったのか(勝ち馬・上位馬のスコア分析) =====
+                        st.subheader("🏆 なぜこの馬が来たのか(上位馬のスコア分析)")
+                        st.caption("実際に上位(1〜3着)に来た馬が、どのスコアが高かったかを見ます。"
+                                   "勝ち馬に共通して高いスコアが、このレースで効いた要素です。"
+                                   "次の予想や重み調整のヒントに。")
+
+                        score_jp = {"zenso": "前走", "speed": "速さ", "fit": "適性",
+                                    "klass": "クラス", "jockey": "騎手"}
+                        top_horses = sorted(
+                            [c for c in comp if c["実際の着順"] is not None],
+                            key=lambda x: x["実際の着順"])[:3]
+                        if top_horses:
+                            for c in top_horses:
+                                medal = {1: "🥇", 2: "🥈", 3: "🥉"}.get(c["実際の着順"], "")
+                                # その馬で一番高かったスコアを見つける
+                                scores = {k: c[v] for k, v in score_jp.items()
+                                          if c[v] is not None}
+                                if scores:
+                                    best_key = max(scores, key=scores.get)
+                                    best_jp = score_jp[best_key]
+                                    best_val = scores[best_key]
+                                    strong = f"一番高かったのは【{best_jp}】偏差値{best_val}"
+                                else:
+                                    strong = "スコアデータなし"
+                                with st.expander(
+                                    f'{medal} {c["実際の着順"]}着 {c["馬名"]}'
+                                    f'(予想{c["予想順位"]}位 / 予想点{c["予想点"]})',
+                                    expanded=(c["実際の着順"] == 1)):
+                                    cols = st.columns(5)
+                                    for i, (k, jp) in enumerate(score_jp.items()):
+                                        cols[i].metric(jp, c[jp] if c[jp] is not None else "—")
+                                    st.caption(strong)
+                                    # 予想と結果のズレについてコメント
+                                    if c["予想順位"] == 1 and c["実際の着順"] == 1:
+                                        st.success("予想本命がそのまま勝利。ロジックが噛み合ったレース。")
+                                    elif c["予想順位"] > 5 and c["実際の着順"] <= 3:
+                                        st.warning(f"予想{c['予想順位']}位の伏兵が好走。"
+                                                   f"この馬の【{best_jp}】の強さを、"
+                                                   f"予想で過小評価していたかも。")
+
+                            # 全体のひとことまとめ
+                            winner = top_horses[0]
+                            if winner["予想順位"] == 1:
+                                st.info("💡 この回は予想本命が勝ちました。今の重み設定が機能しています。")
+                            elif winner["予想順位"] <= 3:
+                                st.info("💡 勝ち馬は予想でも上位。おおむね良い予想でした。")
+                            else:
+                                wscores = {k: winner[v] for k, v in score_jp.items()
+                                           if winner[v] is not None}
+                                if wscores:
+                                    wbest = score_jp[max(wscores, key=wscores.get)]
+                                    st.info(f"💡 勝ち馬は予想{winner['予想順位']}位の伏兵。"
+                                            f"この馬は【{wbest}】が高めでした。"
+                                            f"⚙️設定で【{wbest}】の重みを上げると、"
+                                            f"こういう馬を拾えるようになるかもしれません。")
+
                 # ===== 結果の手編集 =====
                 with st.expander("✏️ 結果を手で修正・追記する"):
                     st.caption("1頭ずつ選んで、着順・タイム・着差・上がり・通過順・馬体重・調教師を直せます。")
