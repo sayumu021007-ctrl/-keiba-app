@@ -1458,8 +1458,8 @@ st.title("🏇 競馬予想分析アプリ")
 menu = st.sidebar.radio(
     "メニュー",
     ["📊 ダッシュボード", "🐎 馬", "👤 騎手", "📅 レース",
-     "🎯 予想", "📈 ランキング", "🏆 結果",
-     "📝 出馬表取り込み", "📋 結果取り込み", "💰 収支",
+     "🎯 予想", "📈 ランキング",
+     "📥 取り込み", "💰 収支",
      "⚙️ 設定"]
 )
 
@@ -1743,7 +1743,7 @@ elif menu == "👤 騎手":
 # レース
 # ------------------------------------------------------------
 elif menu == "📅 レース":
-    st.header("レース一覧")
+    st.header("📅 レース")
     races = load_table("races")
 
     # 1. 検索 + 一覧(上)
@@ -1760,6 +1760,101 @@ elif menu == "📅 レース":
         st.dataframe(jp(view.sort_values("date", ascending=False)),
                      use_container_width=True, hide_index=True)
 
+        st.divider()
+
+        # 2. レースを選んで「結果」を細かく見る + 手編集
+        st.subheader("🏆 レースの結果を見る・編集する")
+        race_opt = {f'{r["date"]} {r["course"]} {r["name"]}': r["id"]
+                    for _, r in view.sort_values("date", ascending=False).iterrows()}
+        sel = st.selectbox("レースを選ぶ", [""] + list(race_opt.keys()), key="race_result_sel")
+        if sel:
+            rid = race_opt[sel]
+            race_row = races[races["id"] == rid].iloc[0]
+            st.caption(f'{race_row["surface"]}{race_row["distance"]}m'
+                       f'（{categorize_distance(race_row["distance"])}） '
+                       f'/ {race_row["turn"]}回り / 馬場:{race_row["track_condition"]} '
+                       f'/ 天気:{race_row["weather"]} / クラス:{race_row.get("class","") or "未設定"}')
+
+            conn = get_connection()
+            df = pd.read_sql(f"""
+                SELECT r.finish AS 着順, e.frame AS 枠, e.number AS 馬番,
+                       h.name AS 馬名, j.name AS 騎手,
+                       r.time AS タイム, r.margin AS 着差,
+                       r.agari AS 上がり, r.corner AS 通過順,
+                       e.popularity AS 人気, r.body_weight AS 馬体重,
+                       r.trainer AS 調教師, r.hit AS 的中
+                FROM entries e
+                LEFT JOIN horses h ON e.horse_id=h.id
+                LEFT JOIN jockeys j ON e.jockey_id=j.id
+                LEFT JOIN results r ON e.id=r.entry_id
+                WHERE e.race_id={PH}
+                ORDER BY CASE WHEN r.finish IS NULL THEN 999 ELSE r.finish END""",
+                conn._conn, params=(rid,))
+            conn.close()
+
+            if len(df) == 0:
+                st.info("このレースの出走・結果データがありません。"
+                        "「📥 取り込み」で結果を取り込んでください。")
+            else:
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+                # ===== 結果の手編集 =====
+                with st.expander("✏️ 結果を手で修正・追記する"):
+                    st.caption("1頭ずつ選んで、着順・タイム・着差・上がり・通過順・馬体重・調教師を直せます。")
+                    # 出走馬の一覧(entry_idと馬名)
+                    conn = get_connection()
+                    ent_rows = conn.execute(f"""
+                        SELECT e.id AS entry_id, e.number AS num, h.name AS hname
+                        FROM entries e LEFT JOIN horses h ON e.horse_id=h.id
+                        WHERE e.race_id={PH} ORDER BY e.number""", (rid,)).fetchall()
+                    conn.close()
+                    edit_opt = {f'{r["num"]}番 {r["hname"]}': r["entry_id"] for r in ent_rows}
+                    edit_sel = st.selectbox("編集する馬", [""] + list(edit_opt.keys()),
+                                            key="edit_horse_sel")
+                    if edit_sel:
+                        eid = edit_opt[edit_sel]
+                        # 現在の結果を取得
+                        conn = get_connection()
+                        cur_row = conn.execute(
+                            f"SELECT * FROM results WHERE entry_id={PH}", (eid,)).fetchone()
+                        conn.close()
+                        cur = dict(cur_row) if cur_row else {}
+
+                        with st.form("edit_result_form"):
+                            c1, c2, c3 = st.columns(3)
+                            ef_finish = c1.text_input("着順", str(cur.get("finish") or ""))
+                            ef_time = c2.text_input("タイム", cur.get("time") or "")
+                            ef_margin = c3.text_input("着差", cur.get("margin") or "")
+                            c4, c5, c6 = st.columns(3)
+                            ef_agari = c4.text_input("上がり", cur.get("agari") or "")
+                            ef_corner = c5.text_input("通過順(例 3-3-2-1)", cur.get("corner") or "")
+                            ef_bw = c6.text_input("馬体重", cur.get("body_weight") or "")
+                            ef_trainer = st.text_input("調教師", cur.get("trainer") or "")
+                            if st.form_submit_button("💾 保存する"):
+                                # finishは数字に変換(空ならNULL)
+                                try:
+                                    fin_val = int(ef_finish) if ef_finish.strip() else None
+                                except ValueError:
+                                    fin_val = None
+                                hit_val = 1 if (fin_val is not None and fin_val <= 3) else 0
+                                if cur_row:
+                                    # 既存の結果を更新
+                                    run_sql(f"""UPDATE results SET finish={PH}, time={PH},
+                                               margin={PH}, agari={PH}, corner={PH},
+                                               body_weight={PH}, trainer={PH}, hit={PH}
+                                               WHERE entry_id={PH}""",
+                                            (fin_val, ef_time, ef_margin, ef_agari, ef_corner,
+                                             ef_bw, ef_trainer, hit_val, eid))
+                                else:
+                                    # 結果が無ければ新規作成
+                                    run_sql(f"""INSERT INTO results
+                                               (race_id, entry_id, finish, hit, time, margin,
+                                                agari, corner, body_weight, trainer)
+                                               VALUES ({PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH},{PH})""",
+                                            (rid, eid, fin_val, hit_val, ef_time, ef_margin,
+                                             ef_agari, ef_corner, ef_bw, ef_trainer))
+                                st.success("保存しました。"); st.rerun()
+
         # レース削除
         with st.expander("🗑 レースを削除"):
             del_opt = {f'{r["date"]} {r["name"]}': r["id"] for _, r in view.iterrows()}
@@ -1771,7 +1866,7 @@ elif menu == "📅 レース":
                 run_sql("DELETE FROM results WHERE race_id=?", (rid,))
                 st.success("削除しました(出走・結果も一緒に削除)。"); st.rerun()
 
-    # 2. 追加フォーム(下)
+    # 3. 追加フォーム(下)
     st.divider()
     with st.expander("➕ レースを手動で追加"):
         st.caption("※ 通常はレース結果ページのコピペ取り込みが便利です(📋 結果取り込み)")
@@ -2015,192 +2110,145 @@ elif menu == "📈 ランキング":
 # ------------------------------------------------------------
 # 結果
 # ------------------------------------------------------------
-elif menu == "🏆 結果":
-    st.header("レース結果")
-    races = load_table("races")
-    if len(races) == 0:
-        st.info("先にレースを登録してください。")
-    else:
-        race_opt = {f'{r["date"]} {r["name"]}': r["id"] for _, r in races.iterrows()}
-        choice = st.selectbox("レースを選ぶ", list(race_opt.keys()))
-        race_id = race_opt[choice]
-        conn = get_connection()
-        df = pd.read_sql(f"""
-            SELECT r.finish AS 着順, e.frame AS 枠, e.number AS 馬番,
-                   h.name AS 馬名, j.name AS 騎手,
-                   r.time AS タイム, r.margin AS 着差,
-                   r.agari AS 上がり, r.corner AS 通過順,
-                   e.popularity AS 人気, r.body_weight AS 馬体重,
-                   r.trainer AS 調教師, r.hit AS 的中
-            FROM entries e
-            LEFT JOIN horses h ON e.horse_id=h.id
-            LEFT JOIN jockeys j ON e.jockey_id=j.id
-            LEFT JOIN results r ON e.id=r.entry_id
-            WHERE e.race_id={PH}
-            ORDER BY CASE WHEN r.finish IS NULL THEN 999 ELSE r.finish END""",
-            conn._conn, params=(race_id,))
-        conn.close()
-        if len(df) == 0:
-            st.info("このレースの出走・結果データがありません。")
-        else:
-            st.dataframe(df, use_container_width=True, hide_index=True)
+elif menu == "📥 取り込み":
+    st.header("📥 取り込み")
+    st.caption("出馬表(これから走るレース)と、結果(終わったレース)を取り込みます。"
+               "下のタブで切り替えてください。")
 
+    tab_shutuba, tab_result = st.tabs(["📝 出馬表(予想用)", "🏆 結果(終わったレース)"])
 
-# ------------------------------------------------------------
-# 収支
-# ------------------------------------------------------------
-# ------------------------------------------------------------
-# 出馬表取り込み(これから走るレース)
-# ------------------------------------------------------------
-elif menu == "📝 出馬表取り込み":
-    st.header("📝 出馬表の取り込み(これから走るレース)")
-    st.markdown("""
-    **これから走るレースの出馬表**を取り込んで、予想できるようにします。
-    (終わったレースは「📋 結果取り込み」を使ってください)
+    # ===== タブ1: 出馬表取り込み =====
+    with tab_shutuba:
+        st.markdown("""
+        **これから走るレースの出馬表**を取り込んで、予想できるようにします。
 
-    **使い方:**
-    1. JRA公式の「**馬体重・オッズ入り出馬表**」または「**出馬表**」ページをPCで開く
-    2. ページ全体を選択してコピー (Ctrl+A → Ctrl+C)
-    3. 下のボックスに貼り付け (Ctrl+V)
-    4. 「取り込む」ボタンを押す → レース・馬・騎手・出走を登録
+        1. JRA公式の「**馬体重・オッズ入り出馬表**」または「**出馬表**」ページを開く
+        2. ページ全体をコピー (Ctrl+A → Ctrl+C)
+        3. 下に貼り付け (Ctrl+V) → 「読み取る」→ 確認 → 「取り込む」
 
-    取り込んだら「🎯 予想」でそのレースを選ぶと、過去成績から予想点が出ます。
-    """)
+        取り込んだら「🎯 予想」でそのレースを選ぶと予想点が出ます。
+        """)
 
-    if st.session_state.get("clear_shutuba_text", False):
-        st.session_state["shutuba_text_area"] = ""
-        st.session_state["clear_shutuba_text"] = False
+        if st.session_state.get("clear_shutuba_text", False):
+            st.session_state["shutuba_text_area"] = ""
+            st.session_state["clear_shutuba_text"] = False
 
-    text_input = st.text_area("出馬表テキストを貼り付け", height=300,
-                              key="shutuba_text_area",
-                              placeholder="JRAの出馬表ページから、Ctrl+A → Ctrl+C → ここに貼り付け")
+        text_input_s = st.text_area("出馬表テキストを貼り付け", height=250,
+                                    key="shutuba_text_area",
+                                    placeholder="JRAの出馬表ページから、Ctrl+A → Ctrl+C → ここに貼り付け")
 
-    # ステップ1: 「読み取る」で内容を確認(まだ登録しない)
-    if st.button("🔍 読み取る(確認)", type="primary"):
-        if not text_input.strip():
-            st.session_state["shutuba_parsed"] = None
-            st.error("テキストが空です。貼り付けてください。")
-        else:
-            with st.spinner("解析中..."):
-                parsed = parse_jra_shutuba(text_input)
-            st.session_state["shutuba_parsed"] = parsed
-            st.session_state["shutuba_raw"] = text_input
-
-    # 読み取り結果があれば表示して、取り込むか確認
-    parsed = st.session_state.get("shutuba_parsed")
-    if parsed:
-        if not parsed["race"].get("name"):
-            st.warning("⚠️ レース情報が読み取れませんでした。出馬表全体を貼ったか確認してください。")
-        elif not parsed["entries"]:
-            st.warning("⚠️ 出走馬が読み取れませんでした。")
-        else:
-            n = len(parsed["entries"])
-            st.subheader(f"📋 読み取り結果: {n}頭")
-            race = parsed["race"]
-            st.write(f"**レース:** {race.get('name','?')} "
-                     f"／ {race.get('date','?')} {race.get('course','')} "
-                     f"{race.get('surface','')}{race.get('distance','')}m")
-            st.dataframe(pd.DataFrame(parsed["entries"])[
-                ["枠", "馬番", "馬名", "性別", "年齢", "斤量", "騎手", "オッズ", "人気"]
-            ], use_container_width=True, hide_index=True)
-
-            st.warning(f"⚠️ **{n}頭** 読み取れました。"
-                       f"本来の出走頭数と合っているか、上の一覧で確認してください。\n\n"
-                       f"足りない場合は、出馬表をコピーし直して「読み取る」をやり直してください。")
-
-            col_ok, col_no = st.columns(2)
-            if col_ok.button("✅ この内容で取り込む", type="primary"):
-                ok, msg = import_shutuba_from_text(st.session_state.get("shutuba_raw", ""))
-                if ok:
-                    st.success(msg)
-                    st.session_state["shutuba_parsed"] = None
-                    st.session_state["clear_shutuba_text"] = True
-                else:
-                    st.error(msg)
-            if col_no.button("❌ やめる"):
+        if st.button("🔍 読み取る(確認)", type="primary", key="read_shutuba"):
+            if not text_input_s.strip():
                 st.session_state["shutuba_parsed"] = None
-                st.info("取り込みをキャンセルしました。")
-                st.rerun()
+                st.error("テキストが空です。貼り付けてください。")
+            else:
+                with st.spinner("解析中..."):
+                    parsed = parse_jra_shutuba(text_input_s)
+                st.session_state["shutuba_parsed"] = parsed
+                st.session_state["shutuba_raw"] = text_input_s
 
+        parsed = st.session_state.get("shutuba_parsed")
+        if parsed:
+            if not parsed["race"].get("name"):
+                st.warning("⚠️ レース情報が読み取れませんでした。出馬表全体を貼ったか確認してください。")
+            elif not parsed["entries"]:
+                st.warning("⚠️ 出走馬が読み取れませんでした。")
+            else:
+                n = len(parsed["entries"])
+                st.subheader(f"📋 読み取り結果: {n}頭")
+                race = parsed["race"]
+                st.write(f"**レース:** {race.get('name','?')} "
+                         f"／ {race.get('date','?')} {race.get('course','')} "
+                         f"{race.get('surface','')}{race.get('distance','')}m")
+                st.dataframe(pd.DataFrame(parsed["entries"])[
+                    ["枠", "馬番", "馬名", "性別", "年齢", "斤量", "騎手", "オッズ", "人気"]
+                ], use_container_width=True, hide_index=True)
+                st.warning(f"⚠️ **{n}頭** 読み取れました。"
+                           f"本来の出走頭数と合っているか、上の一覧で確認してください。\n\n"
+                           f"足りない場合は、出馬表をコピーし直して「読み取る」をやり直してください。")
+                col_ok, col_no = st.columns(2)
+                if col_ok.button("✅ この内容で取り込む", type="primary", key="do_shutuba"):
+                    ok, msg = import_shutuba_from_text(st.session_state.get("shutuba_raw", ""))
+                    if ok:
+                        st.success(msg)
+                        st.session_state["shutuba_parsed"] = None
+                        st.session_state["clear_shutuba_text"] = True
+                    else:
+                        st.error(msg)
+                if col_no.button("❌ やめる", key="cancel_shutuba"):
+                    st.session_state["shutuba_parsed"] = None
+                    st.info("取り込みをキャンセルしました。")
+                    st.rerun()
 
-# ------------------------------------------------------------
-# 結果取り込み
-# ------------------------------------------------------------
-elif menu == "📋 結果取り込み":
-    st.header("📋 JRA結果ページの取り込み")
-    st.markdown("""
-    **使い方:**
-    1. JRA公式の「レース結果ページ」をPCのブラウザで開く
-    2. ページ全体を選択してコピー (Ctrl+A → Ctrl+C)
-    3. 下のボックスに貼り付け (Ctrl+V)
-    4. 「取り込む」ボタンを押す → レース・馬・騎手・出走・結果を全部自動登録
+    # ===== タブ2: 結果取り込み =====
+    with tab_result:
+        st.markdown("""
+        **終わったレースの結果**を取り込みます。データが溜まるほど予想が賢くなります。
 
-    **連続取り込み:** 取り込み成功後、テキスト欄が自動で空になります。次のレースをすぐ貼り付けてください。
-    """)
+        1. JRA公式の「**レース結果ページ**」を開く
+        2. ページ全体をコピー (Ctrl+A → Ctrl+C)
+        3. 下に貼り付け (Ctrl+V) → 「読み取る」→ 確認 → 「取り込む」
+        """)
 
-    # 「次の入力でクリア」フラグが立っていたら、テキストを空にしてフラグを下ろす
-    if st.session_state.get("clear_import_text", False):
-        st.session_state["import_text_area"] = ""
-        st.session_state["clear_import_text"] = False
+        if st.session_state.get("clear_import_text", False):
+            st.session_state["import_text_area"] = ""
+            st.session_state["clear_import_text"] = False
 
-    text_input = st.text_area("結果テキストを貼り付け", height=300,
-                              key="import_text_area",
-                              placeholder="JRAのレース結果ページから、Ctrl+A → Ctrl+C → ここに貼り付け")
+        text_input_r = st.text_area("結果テキストを貼り付け", height=250,
+                                    key="import_text_area",
+                                    placeholder="JRAのレース結果ページから、Ctrl+A → Ctrl+C → ここに貼り付け")
 
-    col_a, col_b = st.columns([1, 4])
-    do_read = col_a.button("🔍 読み取る(確認)", type="primary")
-    do_clear = col_b.button("🧹 クリア")
+        col_a, col_b = st.columns([1, 4])
+        do_read = col_a.button("🔍 読み取る(確認)", type="primary", key="read_result")
+        do_clear = col_b.button("🧹 クリア", key="clear_result")
 
-    if do_clear:
-        st.session_state["result_parsed"] = None
-        st.session_state["clear_import_text"] = True
-        st.rerun()
-
-    # ステップ1: 読み取り(まだ登録しない)
-    if do_read:
-        if not text_input.strip():
+        if do_clear:
             st.session_state["result_parsed"] = None
-            st.error("テキストが空です。貼り付けてください。")
-        else:
-            with st.spinner("解析中..."):
-                parsed = parse_jra_full(text_input)
-            st.session_state["result_parsed"] = parsed
-            st.session_state["result_raw"] = text_input
+            st.session_state["clear_import_text"] = True
+            st.rerun()
 
-    # ステップ2: 確認して取り込み
-    parsed = st.session_state.get("result_parsed")
-    if parsed:
-        if not parsed["race"].get("name"):
-            st.warning("⚠️ レース情報が読み取れませんでした。テキスト全体を貼ったか確認してください。")
-        elif not parsed["results"]:
-            st.warning("⚠️ 出走馬の結果が読み取れませんでした。")
-        else:
-            n = len(parsed["results"])
-            st.subheader(f"📋 読み取り結果: {n}頭")
-            race = parsed["race"]
-            st.write(f"**レース:** {race.get('name','?')} "
-                     f"／ {race.get('date','?')} {race.get('course','')} "
-                     f"{race.get('surface','')}{race.get('distance','')}m")
-            st.dataframe(pd.DataFrame(parsed["results"]),
-                         use_container_width=True, hide_index=True)
-            st.warning(f"⚠️ **{n}頭** 読み取れました。"
-                       f"本来の出走頭数と合っているか、上の一覧で確認してください。\n\n"
-                       f"足りない場合は、結果ページをコピーし直して「読み取る」をやり直してください。")
-
-            col_ok, col_no = st.columns(2)
-            if col_ok.button("✅ この内容で取り込む", type="primary"):
-                ok, msg = import_race_from_text(st.session_state.get("result_raw", ""))
-                if ok:
-                    st.success(msg)
-                    st.session_state["result_parsed"] = None
-                    st.session_state["clear_import_text"] = True
-                    st.info("👇 次のレースを貼り付けて、また「読み取る」を押してください")
-                else:
-                    st.error(msg)
-            if col_no.button("❌ やめる"):
+        if do_read:
+            if not text_input_r.strip():
                 st.session_state["result_parsed"] = None
-                st.info("取り込みをキャンセルしました。")
-                st.rerun()
+                st.error("テキストが空です。貼り付けてください。")
+            else:
+                with st.spinner("解析中..."):
+                    parsed = parse_jra_full(text_input_r)
+                st.session_state["result_parsed"] = parsed
+                st.session_state["result_raw"] = text_input_r
+
+        parsed = st.session_state.get("result_parsed")
+        if parsed:
+            if not parsed["race"].get("name"):
+                st.warning("⚠️ レース情報が読み取れませんでした。テキスト全体を貼ったか確認してください。")
+            elif not parsed["results"]:
+                st.warning("⚠️ 出走馬の結果が読み取れませんでした。")
+            else:
+                n = len(parsed["results"])
+                st.subheader(f"📋 読み取り結果: {n}頭")
+                race = parsed["race"]
+                st.write(f"**レース:** {race.get('name','?')} "
+                         f"／ {race.get('date','?')} {race.get('course','')} "
+                         f"{race.get('surface','')}{race.get('distance','')}m")
+                st.dataframe(pd.DataFrame(parsed["results"]),
+                             use_container_width=True, hide_index=True)
+                st.warning(f"⚠️ **{n}頭** 読み取れました。"
+                           f"本来の出走頭数と合っているか、上の一覧で確認してください。\n\n"
+                           f"足りない場合は、結果ページをコピーし直して「読み取る」をやり直してください。")
+                col_ok, col_no = st.columns(2)
+                if col_ok.button("✅ この内容で取り込む", type="primary", key="do_result"):
+                    ok, msg = import_race_from_text(st.session_state.get("result_raw", ""))
+                    if ok:
+                        st.success(msg)
+                        st.session_state["result_parsed"] = None
+                        st.session_state["clear_import_text"] = True
+                        st.info("👇 次のレースを貼り付けて、また「読み取る」を押してください")
+                    else:
+                        st.error(msg)
+                if col_no.button("❌ やめる", key="cancel_result"):
+                    st.session_state["result_parsed"] = None
+                    st.info("取り込みをキャンセルしました。")
+                    st.rerun()
 
 
 # ------------------------------------------------------------
